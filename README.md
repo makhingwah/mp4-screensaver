@@ -1,5 +1,5 @@
 #### Overview
-`mp4_screensaver_A4.py` is an advanced iteration (version A4) of a Windows-focused MP4 video screensaver application named "MP4Saver". It builds on previous versions by incorporating improvements from a referenced document ("MP4_screensaver_A4 modification.docx"), emphasizing stability through a parent-child process split where VLC media playback is isolated to the child process. The app allows users to play MP4 videos as a screensaver, with configurable playlists, scheduling, password protection, and optional advanced features. It is designed for Windows 10/11 (using Windows APIs for power management and authentication), with Python 3.12+ as the runtime. Key dependencies include PyQt6 for the GUI, python-vlc for playback, and optional libraries like Flask for remote control and croniter for advanced scheduling (though the latter's implementation is a placeholder).
+`mp4_screensaver_A7.py` is an advanced iteration (version A7) of a Windows-focused MP4 video screensaver application named "MP4Saver". It builds on previous versions by incorporating improvements from a referenced document ("MP4_screensaver_A7 modification.docx"), emphasizing stability through a parent-child process split where VLC media playback is isolated to the child process. The app allows users to play MP4 videos as a screensaver, with configurable playlists, scheduling, password protection, and optional advanced features. It is designed for Windows 10/11 (using Windows APIs for power management and authentication), with Python 3.12+ as the runtime. Key dependencies include PyQt6 for the GUI, python-vlc for playback, and optional libraries like Flask for remote control and croniter for advanced scheduling (though the latter's implementation is a placeholder).
 
 The script is approximately 2,000 lines long, modular, and well-structured, with robust error handling, logging, and configuration management. It prioritizes stability by loading VLC only in the child process, using `os._exit` for quick termination (with an optional explicit cleanup mode to release resources). The code is Windows-centric (`IS_WINDOWS` checks skip features on other OS), making it unsuitable for cross-platform use without modifications.
 
@@ -37,8 +37,8 @@ The script is approximately 2,000 lines long, modular, and well-structured, with
 #### Installation
 1. **From Source** (Recommended for Developers):
    - Prerequisites: Python 3.12+, PyQt6 (`pip install PyQt6`), python-vlc (`pip install python-vlc`), 64-bit VLC installed (e.g., from videolan.org). Optional: Flask (`pip install flask`) for remote, croniter (`pip install croniter`) for advanced scheduling.
-   - Download `mp4_screensaver_A4.py` from GitHub.
-   - Run: `python mp4_screensaver_A4.py` (add `--debug` for verbose logs).
+   - Download `mp4_screensaver_A7.py` from GitHub.
+   - Run: `python mp4_screensaver_A7.py` (add `--debug` for verbose logs).
 
 2. **From Compiled Executable** (`mp4_screensaver_B.exe`):
    - Download the .exe (if provided in releases).
@@ -88,7 +88,7 @@ Based on best practices for Python GUI apps on GitHub, here's a step-by-step gui
    - License: Add MIT or GPL-3.0 (open-source; allows free use/modification).
 
 2. **Structure the Repository**:
-   - **Root**: `mp4_screensaver_A4.py` (source), README.md, LICENSE.
+   - **Root**: `mp4_screensaver_A7.py` (source), README.md, LICENSE.
    - **docs/**: User guide (as markdown), report (this document as REPORT.md).
    - **requirements.txt**: List deps e.g., PyQt6, python-vlc, flask (optional), croniter (optional).
    - **compilation.md**: Instructions for PyInstaller/Nuitka (include your commands).
@@ -97,7 +97,7 @@ Based on best practices for Python GUI apps on GitHub, here's a step-by-step gui
 3. **Commit and Push**:
    - Clone repo locally: `git clone https://github.com/yourusername/MP4Saver.git`.
    - Add files: `git add .`.
-   - Commit: `git commit -m "Initial release of MP4Saver A4"`.
+   - Commit: `git commit -m "Initial release of MP4Saver A7"`.
    - Push: `git push origin main`.
 
 4. **README.md Content**:
@@ -110,7 +110,8 @@ Based on best practices for Python GUI apps on GitHub, here's a step-by-step gui
 5. **Releases**:
    - Create release: Go to repo > Releases > Draft new release.
    - Tag: v1.0.0.
-   - Title: "Initial Release - A4 Version".
+   - Title: "Initial Release - A7
+   -  Version".
    - Description: Changelog, features.
    - Attach `mp4_screensaver_B.exe` (zip if large; warn about antivirus).
    - Publish.
