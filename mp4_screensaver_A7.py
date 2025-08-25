@@ -1,9 +1,12 @@
-# --- MP4Saver A4 ---
-# Parent/child split (A3) + improvements from "MP4_screensaver_A4 modification.docx"
-# - Stable: VLC only in child. Parent controls via QProcess and exit codes.
-# - Optional features: multi-monitor, transition overlay, remote control (Flask), advanced scheduling placeholder.
-# - Optional teardown (explicit cleanup) mode in child (default off; default is os._exit on unlock/close).
-# ------------------------------------------------------------
+# --- MP4Saver A7 ---
+# Changes from A6:
+# - Removed force-stop safeguard entirely.
+# - Duration end behavior:
+#   * unlock_mode == "no_password": child exits immediately (return to desktop).
+#   * unlock_mode == "windows"/"custom": child pauses and shows password dialog immediately.
+#       - Only correct password exits to desktop.
+#       - If cancelled or incorrect, playback resumes and continues (loop if configured).
+# Parent never force-terminates the child due to duration; user decision via password fully controls exit.
 
 import sys
 import os
@@ -18,6 +21,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import socket
+import threading
 import faulthandler
 
 APP_NAME = "MP4Saver"
@@ -144,30 +149,45 @@ class ConfigManager:
             "shuffle": False,
             "loop": True,
             "volume": 100,
+
             "schedule_enabled": False,
             "schedule_time": "20:00",
+            "schedule_forever": True,
             "schedule_duration_min": 60,
+
             "power_prevent_sleep": True,
             "unlock_mode": "windows",  # "no_password" | "windows" | "custom"
             "custom_pw_salt": "",
             "custom_pw_hash": "",
             "custom_pw_rounds": 200000,
+
             "vlc_force_d3d11": True,
             "enable_vlc_file_log": DEBUG_MODE,
+
             "waiting_enabled": False,
             "waiting_minutes": 5,
             "armed": False,
-            # A4 additions:
+
             "multi_monitor_enable": False,
             "transition_enable": False,
             "transition_duration_ms": 600,
             "remote_control_enable": False,
             "remote_control_port": 8080,
             "advanced_schedule_enable": False,
-            "advanced_schedule_rule": "",  # e.g., "*/15 9-17 * * MON-FRI"
-            "explicit_cleanup_on_exit": False,  # A4: child explicit cleanup mode (default False)
+            "advanced_schedule_rule": "",
+            "explicit_cleanup_on_exit": False,
         }
         self.load()
+        self._migrate_duration()
+
+    def _migrate_duration(self):
+        if "schedule_forever" not in self.data:
+            minutes = int(self.data.get("schedule_duration_min", 60))
+            if minutes <= 0:
+                self.data["schedule_forever"] = True
+                self.data["schedule_duration_min"] = 60
+            else:
+                self.data["schedule_forever"] = False
 
     def load(self):
         try:
@@ -187,10 +207,81 @@ class ConfigManager:
             logger.warning("Failed to save config: %s", e)
 
 # ============================================================
-# Parent Process (Controller) - does NOT load VLC
+# Parent (Controller): Qt UI + Scheduler + TCP Control Server
 # ============================================================
 if not CHILD_MODE:
     from PyQt6 import QtCore, QtGui, QtWidgets
+
+    class ControlServer(QtCore.QObject):
+        connected = QtCore.pyqtSignal()
+        disconnected = QtCore.pyqtSignal()
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._srv_sock: Optional[socket.socket] = None
+            self._cli_sock: Optional[socket.socket] = None
+            self._port: int = 0
+            self._lock = threading.Lock()
+        def start(self) -> int:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 0))
+            s.listen(1)
+            addr, port = s.getsockname()
+            self._srv_sock = s
+            self._port = port
+            t = threading.Thread(target=self._accept_loop, daemon=True)
+            t.start()
+            logger.info("ControlServer listening on 127.0.0.1:%d", port)
+            return port
+        def _accept_loop(self):
+            try:
+                self._srv_sock.settimeout(1.0)
+            except Exception:
+                pass
+            while True:
+                try:
+                    if self._srv_sock is None:
+                        return
+                    try:
+                        cli, addr = self._srv_sock.accept()
+                    except socket.timeout:
+                        continue
+                    with self._lock:
+                        if self._cli_sock is not None:
+                            try: self._cli_sock.close()
+                            except Exception: pass
+                        self._cli_sock = cli
+                    logger.info("ControlServer: child connected from %s:%s", addr[0], addr[1])
+                    self.connected.emit()
+                    return
+                except Exception as e:
+                    logger.warning("ControlServer accept loop error: %s", e)
+                    return
+        def send_json(self, obj: dict) -> bool:
+            data = (json.dumps(obj) + "\n").encode("utf-8")
+            with self._lock:
+                if not self._cli_sock:
+                    return False
+                try:
+                    self._cli_sock.sendall(data)
+                    return True
+                except Exception as e:
+                    logger.warning("ControlServer send_json failed: %s", e)
+                    try: self._cli_sock.close()
+                    except Exception: pass
+                    self._cli_sock = None
+                    self.disconnected.emit()
+                    return False
+        def stop(self):
+            with self._lock:
+                if self._cli_sock:
+                    try: self._cli_sock.close()
+                    except Exception: pass
+                    self._cli_sock = None
+                if self._srv_sock:
+                    try: self._srv_sock.close()
+                    except Exception: pass
+                    self._srv_sock = None
 
     def get_system_idle_seconds() -> int:
         if not IS_WINDOWS:
@@ -219,37 +310,41 @@ if not CHILD_MODE:
             self.time_edit = QtWidgets.QTimeEdit()
             self.time_edit.setDisplayFormat("HH:mm")
             grid.addWidget(self.time_edit, 1, 1)
-            grid.addWidget(QtWidgets.QLabel("Duration (minutes):"), 2, 0)
+
+            self.forever_checkbox = QtWidgets.QCheckBox("Forever (loop until you unlock)")
+            grid.addWidget(self.forever_checkbox, 2, 0, 1, 2)
+
+            grid.addWidget(QtWidgets.QLabel("Duration (minutes):"), 3, 0)
             self.duration_spin = QtWidgets.QSpinBox()
             self.duration_spin.setRange(1, 24 * 60)
-            grid.addWidget(self.duration_spin, 2, 1)
+            grid.addWidget(self.duration_spin, 3, 1)
 
             self.enable_waiting_checkbox = QtWidgets.QCheckBox("Enable waiting (idle timeout)")
-            grid.addWidget(self.enable_waiting_checkbox, 3, 0, 1, 2)
-            grid.addWidget(QtWidgets.QLabel("Idle minutes:"), 4, 0)
+            grid.addWidget(self.enable_waiting_checkbox, 4, 0, 1, 2)
+            grid.addWidget(QtWidgets.QLabel("Idle minutes:"), 5, 0)
             self.wait_minutes_spin = QtWidgets.QSpinBox()
             self.wait_minutes_spin.setRange(1, 240)
             self.wait_minutes_spin.setSuffix(" min")
-            grid.addWidget(self.wait_minutes_spin, 4, 1)
+            grid.addWidget(self.wait_minutes_spin, 5, 1)
 
-            # A4: Advanced scheduler
             self.adv_enable = QtWidgets.QCheckBox("Enable advanced schedule (cron-like)")
-            grid.addWidget(self.adv_enable, 5, 0, 1, 2)
+            grid.addWidget(self.adv_enable, 6, 0, 1, 2)
             self.adv_rule_edit = QtWidgets.QLineEdit()
             self.adv_rule_edit.setPlaceholderText('e.g. "*/15 9-17 * * MON-FRI"')
-            grid.addWidget(self.adv_rule_edit, 6, 0, 1, 2)
+            grid.addWidget(self.adv_rule_edit, 7, 0, 1, 2)
 
             self.run_btn = QtWidgets.QPushButton("Run")
             self.stop_btn = QtWidgets.QPushButton("Stop")
             self.armed_label = QtWidgets.QLabel("")
-            grid.addWidget(self.run_btn, 7, 0)
-            grid.addWidget(self.stop_btn, 7, 1)
-            grid.addWidget(self.armed_label, 8, 0, 1, 2)
+            grid.addWidget(self.run_btn, 8, 0)
+            grid.addWidget(self.stop_btn, 8, 1)
+            grid.addWidget(self.armed_label, 9, 0, 1, 2)
             self.load_from_config()
             self._wire()
         def _wire(self):
             self.enable_schedule_checkbox.toggled.connect(lambda _: self._save(disarm=True))
             self.time_edit.timeChanged.connect(lambda _: self._save(disarm=True))
+            self.forever_checkbox.toggled.connect(self._on_forever_toggled)
             self.duration_spin.valueChanged.connect(lambda _: self._save(disarm=True))
             self.enable_waiting_checkbox.toggled.connect(lambda _: self._save(disarm=True))
             self.wait_minutes_spin.valueChanged.connect(lambda _: self._save(disarm=True))
@@ -257,6 +352,9 @@ if not CHILD_MODE:
             self.adv_rule_edit.textChanged.connect(lambda _: self._save(disarm=True))
             self.run_btn.clicked.connect(self._confirm)
             self.stop_btn.clicked.connect(self._stop)
+        def _on_forever_toggled(self):
+            self.duration_spin.setEnabled(not self.forever_checkbox.isChecked())
+            self._save(disarm=True)
         def _confirm(self):
             self.config.data["armed"] = True
             self.config.save()
@@ -277,7 +375,9 @@ if not CHILD_MODE:
             except Exception:
                 hh, mm = 20, 0
             self.time_edit.setTime(QtCore.QTime(hh, mm))
+            self.forever_checkbox.setChecked(bool(self.config.data.get("schedule_forever", True)))
             self.duration_spin.setValue(int(self.config.data.get("schedule_duration_min", 60)))
+            self.duration_spin.setEnabled(not self.forever_checkbox.isChecked())
             self.enable_waiting_checkbox.setChecked(bool(self.config.data.get("waiting_enabled", False)))
             self.wait_minutes_spin.setValue(int(self.config.data.get("waiting_minutes", 5)))
             self.adv_enable.setChecked(bool(self.config.data.get("advanced_schedule_enable", False)))
@@ -287,6 +387,7 @@ if not CHILD_MODE:
             t = self.time_edit.time()
             self.config.data["schedule_enabled"] = self.enable_schedule_checkbox.isChecked()
             self.config.data["schedule_time"] = f"{t.hour():02d}:{t.minute():02d}"
+            self.config.data["schedule_forever"] = bool(self.forever_checkbox.isChecked())
             self.config.data["schedule_duration_min"] = int(self.duration_spin.value())
             self.config.data["waiting_enabled"] = self.enable_waiting_checkbox.isChecked()
             self.config.data["waiting_minutes"] = int(self.wait_minutes_spin.value())
@@ -317,7 +418,6 @@ if not CHILD_MODE:
             self.power_checkbox.setChecked(bool(self.config.data.get("power_prevent_sleep", True)))
             layout.addRow("", self.power_checkbox)
 
-            # A4: multi-monitor, transition, remote control, explicit cleanup
             self.mm_checkbox = QtWidgets.QCheckBox("Enable multi-monitor (extend full screen)")
             self.mm_checkbox.setChecked(bool(self.config.data.get("multi_monitor_enable", False)))
             layout.addRow("", self.mm_checkbox)
@@ -490,14 +590,13 @@ if not CHILD_MODE:
     class MainWindow(QtWidgets.QMainWindow):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle(f"{APP_NAME} A4")
+            self.setWindowTitle(f"{APP_NAME} A7")
             self.resize(980, 760)
             self.config = ConfigManager(CONFIG_PATH)
             central = QtWidgets.QWidget()
             self.setCentralWidget(central)
             layout = QtWidgets.QVBoxLayout(central)
-            tabs = QtWidgets.QTabWidget()
-            layout.addWidget(tabs)
+            tabs = QtWidgets.QTabWidget(); layout.addWidget(tabs)
             self.playlist_widget = PlaylistWidget(self.config)
             self.schedule_widget = ScheduleWidget(self.config)
             self.settings_widget = SettingsWidget(self.config)
@@ -508,11 +607,8 @@ if not CHILD_MODE:
             ptab = QtWidgets.QWidget(); ptab_layout = QtWidgets.QVBoxLayout(ptab); ptab_layout.addWidget(self.playlist_widget)
             stab = QtWidgets.QWidget(); stab_layout = QtWidgets.QVBoxLayout(stab); stab_layout.addWidget(self.schedule_widget)
             setab = QtWidgets.QWidget(); setab_layout = QtWidgets.QVBoxLayout(setab); setab_layout.addWidget(self.settings_widget)
-            tabs.addTab(ptab, "Playlist")
-            tabs.addTab(stab, "Schedule")
-            tabs.addTab(setab, "Settings")
-            self.status_label = QtWidgets.QLabel("Ready")
-            layout.addWidget(self.status_label)
+            tabs.addTab(ptab, "Playlist"); tabs.addTab(stab, "Schedule"); tabs.addTab(setab, "Settings")
+            self.status_label = QtWidgets.QLabel("Ready"); layout.addWidget(self.status_label)
 
             menubar = self.menuBar()
             diag = menubar.addMenu("Diagnostics")
@@ -525,10 +621,23 @@ if not CHILD_MODE:
             self.screensaver_active = False
             self.child: Optional[QtCore.QProcess] = None
 
+            # Control server for child
+            self.ctrl_server = ControlServer(self)
+            self.ctrl_port = 0
+            self.ctrl_connected = False
+            self.ctrl_server.connected.connect(self._on_ctrl_connected)
+            self.ctrl_server.disconnected.connect(self._on_ctrl_disconnected)
+
+            # Scheduler tick
             self.scheduler_timer = QtCore.QTimer(self)
             self.scheduler_timer.setInterval(1000)
             self.scheduler_timer.timeout.connect(self.tick_scheduler)
             self.scheduler_timer.start()
+
+            # Duration timer only (no force-kill)
+            self.duration_timer = QtCore.QTimer(self)
+            self.duration_timer.setSingleShot(True)
+            self.duration_timer.timeout.connect(self._on_duration_reached)
 
             if QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
                 self.tray = QtWidgets.QSystemTrayIcon(self)
@@ -555,7 +664,14 @@ if not CHILD_MODE:
             else:
                 QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
 
-        # schedule logic
+        def _on_ctrl_connected(self):
+            self.ctrl_connected = True
+            logger.info("Parent: control channel connected.")
+
+        def _on_ctrl_disconnected(self):
+            self.ctrl_connected = False
+            logger.info("Parent: control channel disconnected.")
+
         def _on_schedule_changed(self):
             self.status_label.setText("Schedule/Waiting changed. Not confirmed.")
             logger.info("Schedule/Waiting settings changed; disarmed.")
@@ -575,10 +691,7 @@ if not CHILD_MODE:
         def _on_test_video(self):
             self.start_screensaver(mode="test")
 
-        # simple cron-like check placeholder
         def _advanced_rule_match_now(self, rule: str, now: datetime.datetime) -> bool:
-            # Minimal parser: supports "*/N HH-HH * * MON-FRI" like patterns (placeholder)
-            # For now, return False if empty; True never auto-match unless exact minute mod matches (*/N).
             if not rule:
                 return False
             try:
@@ -609,7 +722,6 @@ if not CHILD_MODE:
                 return
 
             now = datetime.datetime.now()
-            # idle waiting
             if data.get("waiting_enabled", False):
                 idle_secs = get_system_idle_seconds()
                 need_secs = max(1, int(data.get("waiting_minutes", 5))) * 60
@@ -617,7 +729,6 @@ if not CHILD_MODE:
                     logger.info("Idle timeout reached (%ss). Starting screensaver.", idle_secs)
                     self.start_screensaver(mode="normal")
                     return
-            # simple schedule exact match
             if data.get("schedule_enabled", False):
                 try:
                     hh, mm = [int(x) for x in data.get("schedule_time", "20:00").split(":")]
@@ -627,7 +738,6 @@ if not CHILD_MODE:
                     logger.info("Schedule time matched %02d:%02d. Starting screensaver.", hh, mm)
                     self.start_screensaver(mode="normal")
                     return
-            # advanced schedule (placeholder)
             if data.get("advanced_schedule_enable", False):
                 rule = data.get("advanced_schedule_rule", "").strip()
                 if self._advanced_rule_match_now(rule, now):
@@ -641,10 +751,16 @@ if not CHILD_MODE:
             if not self.config.data.get("playlist", []):
                 self.status_label.setText("No playlist configured.")
                 return
+
+            # Start control server first and get port
+            self.ctrl_server.stop()
+            self.ctrl_port = self.ctrl_server.start()
+            self.ctrl_connected = False
+
             self.child = QtCore.QProcess(self)
             program = sys.executable
             script = str(Path(sys.argv[0]).resolve())
-            args = [script, "--child", f"--mode={mode}"]
+            args = [script, "--child", f"--mode={mode}", f"--ctl-port={self.ctrl_port}"]
             if DEBUG_MODE:
                 args.append("--debug")
             self.child.setProgram(program)
@@ -655,21 +771,37 @@ if not CHILD_MODE:
             if not self.child.waitForStarted(5000):
                 QtWidgets.QMessageBox.critical(self, "Error", "Failed to start screensaver child process.")
                 self.child = None
+                self.ctrl_server.stop()
                 return
             self.screensaver_active = True
             self.status_label.setText("Screensaver running (child).")
+
+            self._start_duration_timer_if_needed()
+
+        def _start_duration_timer_if_needed(self):
+            data = self.config.data
+            self.duration_timer.stop()
+            if data.get("schedule_forever", True):
+                logger.info("Schedule duration: Forever (no timer).")
+                return
+            minutes = max(1, int(data.get("schedule_duration_min", 60)))
+            ms = minutes * 60 * 1000
+            logger.info("Schedule duration timer set for %d minute(s).", minutes)
+            self.duration_timer.start(ms)
 
         def _on_child_finished(self, exitCode: int, exitStatus: QtCore.QProcess.ExitStatus):
             logger.info("Screensaver child finished. exitCode=%s exitStatus=%s", exitCode, exitStatus.name)
             self.screensaver_active = False
             self.child = None
-            if exitCode == 200:  # unlocked
+            self.duration_timer.stop()
+            self.ctrl_server.stop()
+            if exitCode == 200:
                 self.showMinimized()
                 self.status_label.setText("Unlocked. Main minimized.")
-            elif exitCode == 102:  # test_return
+            elif exitCode == 102:
                 self.showNormal(); self.activateWindow(); self.raise_()
                 self.status_label.setText("Returned from Test Video.")
-            elif exitCode == 101:  # user/no_password close
+            elif exitCode == 101:
                 self.showNormal()
                 self.status_label.setText("Screensaver closed.")
             else:
@@ -684,9 +816,29 @@ if not CHILD_MODE:
                     self.child.kill()
                     self.child.waitForFinished(1000)
                 self.child = None
+            self.duration_timer.stop()
+            self.ctrl_server.stop()
             self.screensaver_active = False
             self.status_label.setText("Screensaver stopped.")
             logger.info("Screensaver stopped")
+
+        # Duration reached: send timeout to child. No force-kill, no popup in parent.
+        def _on_duration_reached(self):
+            if not self.screensaver_active or not self.child:
+                return
+            mode = self.config.data.get("unlock_mode", "windows")
+            logger.info("Schedule duration reached. unlock_mode=%s", mode)
+            # Send timeout command. If not connected yet, retry until connected or child exits.
+            def try_send():
+                if not self.screensaver_active or not self.child:
+                    return
+                ok = self.ctrl_server.send_json({"cmd": "timeout"})
+                if not ok:
+                    logger.info("Timeout command send failed (control not connected). Retrying in 1s.")
+                    QtCore.QTimer.singleShot(1000, try_send)
+                else:
+                    logger.info("Timeout command sent to child.")
+            try_send()
 
     def excepthook_parent(exctype, value, tb):
         logger.exception("Uncaught exception (parent)", exc_info=(exctype, value, tb))
@@ -707,14 +859,96 @@ if not CHILD_MODE:
         sys.exit(app.exec())
 
 # ============================================================
-# Child Process (owns VLC + fullscreen player)
+# Child (Player): VLC + Fullscreen + TCP Control Client
 # ============================================================
 if CHILD_MODE:
     from PyQt6 import QtCore, QtGui, QtWidgets
-    # Lazy import VLC in child
     import vlc
 
-    # VLC path setup (child only)
+    def parse_child_args():
+        mode = "normal"
+        ctl_port = 0
+        for arg in sys.argv:
+            if arg.startswith("--mode="):
+                mode = arg.split("=", 1)[1].strip().lower() or "normal"
+            elif arg.startswith("--ctl-port="):
+                try:
+                    ctl_port = int(arg.split("=", 1)[1])
+                except Exception:
+                    ctl_port = 0
+        return mode, ctl_port
+
+    class ControlClient(QtCore.QObject):
+        timeoutCommand = QtCore.pyqtSignal()
+        def __init__(self, port: int, parent=None):
+            super().__init__(parent)
+            self.port = port
+            self._sock: Optional[socket.socket] = None
+            self._thread: Optional[threading.Thread] = None
+            self._stop = threading.Event()
+        def start(self):
+            if self.port <= 0:
+                logger.warning("ControlClient: invalid port; not starting.")
+                return
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        def _run(self):
+            # Try to connect up to ~15 seconds
+            deadline = datetime.datetime.now() + datetime.timedelta(seconds=15)
+            while not self._stop.is_set() and datetime.datetime.now() < deadline:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.connect(("127.0.0.1", self.port))
+                    self._sock = s
+                    logger.info("ControlClient: connected to parent at 127.0.0.1:%d", self.port)
+                    self._recv_loop()
+                    return
+                except Exception:
+                    try:
+                        if self._sock:
+                            self._sock.close()
+                    except Exception:
+                        pass
+                    self._sock = None
+                    QtCore.QThread.msleep(200)
+            logger.warning("ControlClient: failed to connect to parent control server.")
+        def _recv_loop(self):
+            buf = b""
+            while not self._stop.is_set():
+                try:
+                    data = self._sock.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line.decode("utf-8"))
+                        except Exception:
+                            continue
+                        if obj.get("cmd") == "timeout":
+                            logger.info("ControlClient: received timeout command.")
+                            self.timeoutCommand.emit()
+                except Exception:
+                    break
+            try:
+                if self._sock:
+                    self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+        def stop(self):
+            self._stop.set()
+            try:
+                if self._sock:
+                    self._sock.close()
+            except Exception:
+                pass
+
+    # VLC discovery
     def _winreg_get_vlc_dir_from_registry() -> Optional[Path]:
         if not IS_WINDOWS:
             return None
@@ -809,17 +1043,15 @@ if CHILD_MODE:
 
     VLC_DIR, VLC_PLUGINS = setup_vlc_paths_child()
 
-    # Optional VLC file logging in debug
     VLC_FILE_LOGGING_ARGS = []
     if DEBUG_MODE:
         VLC_FILE_LOGGING_ARGS = ["--file-logging", f"--logfile={VLC_LOG_PATH}", "--verbose=2"]
 
-    # Exit codes
     EXIT_TEST_RETURN = 102
     EXIT_USER = 101
     EXIT_UNLOCKED = 200
 
-    # Keyboard/IME helpers (for password field)
+    # Keyboard/IME helpers
     KLF_ACTIVATE = 0x00000001
     def force_english_layout():
         if not IS_WINDOWS:
@@ -855,7 +1087,6 @@ if CHILD_MODE:
             pass
 
     class TransitionOverlay(QtWidgets.QWidget):
-        # Lightweight fade overlay: avoid touching VLC surfaces directly
         def __init__(self, parent=None):
             super().__init__(parent)
             self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -868,15 +1099,10 @@ if CHILD_MODE:
             if self._opacity <= 0.0:
                 return
             p = QtGui.QPainter(self)
-            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
-            c = QtGui.QColor(0, 0, 0)
-            c.setAlphaF(max(0.0, min(1.0, self._opacity)))
+            c = QtGui.QColor(0, 0, 0); c.setAlphaF(max(0.0, min(1.0, self._opacity)))
             p.fillRect(self.rect(), c)
-        def getOpacity(self):
-            return self._opacity
-        def setOpacity(self, v):
-            self._opacity = v
-            self.update()
+        def getOpacity(self): return self._opacity
+        def setOpacity(self, v): self._opacity = v; self.update()
         opacity = QtCore.pyqtProperty(float, fget=getOpacity, fset=setOpacity)
         def crossfade(self, duration_ms=600):
             self._anim.stop()
@@ -897,9 +1123,7 @@ if CHILD_MODE:
             self.video_frame = QtWidgets.QFrame(self)
             self.video_frame.setStyleSheet("background-color: black;")
             self.video_frame.setAttribute(QtCore.Qt.WidgetAttribute.WA_NativeWindow, True)
-            layout = QtWidgets.QVBoxLayout(self)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.addWidget(self.video_frame)
+            layout = QtWidgets.QVBoxLayout(self); layout.setContentsMargins(0,0,0,0); layout.addWidget(self.video_frame)
             instance_args = ["--no-video-title-show", "--quiet"]
             if self.config.data.get("vlc_force_d3d11", True):
                 instance_args += ["--vout=direct3d11"]
@@ -954,8 +1178,7 @@ if CHILD_MODE:
             self._playlist_paths = [p for p in paths if os.path.isfile(p)]
             ordered = list(self._playlist_paths)
             if self._shuffle:
-                import random
-                random.shuffle(ordered)
+                import random; random.shuffle(ordered)
             new_list = self.instance.media_list_new()
             for p in ordered:
                 m = self.instance.media_new(p)
@@ -965,37 +1188,28 @@ if CHILD_MODE:
             logger.info("Playlist set: %d item(s)", len(ordered))
         def play(self):
             if not self._playlist_paths:
-                logger.warning("Play requested with empty playlist")
-                return
+                logger.warning("Play requested with empty playlist"); return
             if not self._bound_hwnd:
                 self.bind_to_window()
             self.set_loop(self._loop)
             logger.info("Starting playback")
             self.media_list_player.play()
         def pause(self):
-            try:
-                self.media_player.pause()
-            except Exception as e:
-                logger.warning("Pause failed: %s", e)
+            try: self.media_player.pause()
+            except Exception as e: logger.warning("Pause failed: %s", e)
         def stop(self):
-            try:
-                self.media_list_player.stop()
-            except Exception as e:
-                logger.warning("Stop failed: %s", e)
+            try: self.media_list_player.stop()
+            except Exception as e: logger.warning("Stop failed: %s", e)
         def _on_list_stopped(self, event):
             logger.debug("MediaListPlayerStopped event")
             if not self._loop:
-                logger.info("Playlist finished (no loop).")
-                self.ended.emit()
+                logger.info("Playlist finished (no loop)."); self.ended.emit()
         def _on_player_error(self, event):
             logger.error("VLC MediaPlayer encountered an error")
             try:
                 m = self.media_player.get_media()
-                if m:
-                    mrl = m.get_mrl()
-                    logger.error("Error while playing: %s", mrl)
-            except Exception:
-                pass
+                if m: logger.error("Error while playing: %s", m.get_mrl())
+            except Exception: pass
         def _on_end_reached(self, event):
             logger.info("VLC: end reached")
 
@@ -1008,33 +1222,20 @@ if CHILD_MODE:
             self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
             panel = QtWidgets.QFrame(self)
             panel.setStyleSheet("""
-                QFrame {
-                    background-color: rgba(20,20,20,220);
-                    border: 1px solid rgba(255,255,255,80);
-                    border-radius: 10px;
-                }
+                QFrame { background-color: rgba(20,20,20,220); border: 1px solid rgba(255,255,255,80); border-radius: 10px; }
                 QLabel { color: white; font-size: 18pt; }
             """)
             msg = QtWidgets.QLabel("Hit any key (or click) to return", panel)
             msg.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            pl = QtWidgets.QVBoxLayout(panel)
-            pl.setContentsMargins(24, 24, 24, 24)
-            pl.addWidget(msg)
+            pl = QtWidgets.QVBoxLayout(panel); pl.setContentsMargins(24,24,24,24); pl.addWidget(msg)
             self._panel = panel
         def resizeEvent(self, e):
             super().resizeEvent(e)
-            w, h = 520, 140
-            x = (self.width() - w) // 2
-            y = (self.height() - h) // 2
-            self._panel.setGeometry(x, y, w, h)
+            w,h=520,140; x=(self.width()-w)//2; y=(self.height()-h)//2; self._panel.setGeometry(x,y,w,h)
         def showEvent(self, e):
-            super().showEvent(e)
-            self.raise_()
-            self.setFocus()
-        def keyPressEvent(self, e: QtGui.QKeyEvent):
-            self.accepted.emit()
-        def mousePressEvent(self, e: QtGui.QMouseEvent):
-            self.accepted.emit()
+            super().showEvent(e); self.raise_(); self.setFocus()
+        def keyPressEvent(self, e: QtGui.QKeyEvent): self.accepted.emit()
+        def mousePressEvent(self, e: QtGui.QMouseEvent): self.accepted.emit()
 
     class UnlockDialog(QtWidgets.QDialog):
         def __init__(self, config: ConfigManager, parent=None):
@@ -1045,23 +1246,16 @@ if CHILD_MODE:
             self.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
             self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
             self.setStyleSheet("""
-                QDialog {
-                    background-color: rgba(20,20,20,230);
-                    border: 1px solid rgba(255,255,255,80);
-                    border-radius: 10px;
-                }
+                QDialog { background-color: rgba(20,20,20,230); border: 1px solid rgba(255,255,255,80); border-radius: 10px; }
                 QLabel, QLineEdit { color: white; font-size: 11pt; }
                 QPushButton { padding: 6px 12px; }
             """)
             self.config = config
             self._prev_hkl = None
             self._prev_himc = None
-            layout = QtWidgets.QVBoxLayout(self)
-            layout.setContentsMargins(24, 24, 24, 24)
+            layout = QtWidgets.QVBoxLayout(self); layout.setContentsMargins(24,24,24,24)
             title = QtWidgets.QLabel("Password enter")
-            f = title.font(); f.setPointSize(16); f.setBold(True)
-            title.setFont(f)
-            layout.addWidget(title)
+            f=title.font(); f.setPointSize(16); f.setBold(True); title.setFont(f); layout.addWidget(title)
             self.info_label = QtWidgets.QLabel()
             umode = self.config.data.get("unlock_mode", "windows")
             if umode == "windows":
@@ -1080,20 +1274,18 @@ if CHILD_MODE:
             btns = QtWidgets.QHBoxLayout()
             self.ok_btn = QtWidgets.QPushButton("Unlock")
             self.cancel_btn = QtWidgets.QPushButton("Cancel")
-            btns.addStretch(1); btns.addWidget(self.cancel_btn); btns.addWidget(self.ok_btn)
-            layout.addLayout(btns)
-            self.ok_btn.clicked.connect(self.try_unlock)
-            self.cancel_btn.clicked.connect(self.reject)
+            btns.addStretch(1); btns.addWidget(self.cancel_btn); btns.addWidget(self.ok_btn); layout.addLayout(btns)
+            self.ok_btn.clicked.connect(self.try_unlock); self.cancel_btn.clicked.connect(self.reject)
             self.result_unlocked = False
         def showEvent(self, e: QtGui.QShowEvent):
             super().showEvent(e)
-            self.resize(420, 180)
+            self.resize(420,180)
             parent = self.parentWidget()
             if parent:
                 geom = parent.geometry()
                 x = geom.x() + (geom.width() - self.width()) // 2
                 y = geom.y() + (geom.height() - self.height()) // 2
-                self.move(max(0, x), max(0, y))
+                self.move(max(0,x), max(0,y))
             self.raise_(); self.activateWindow()
             try:
                 self._prev_hkl = force_english_layout()
@@ -1126,118 +1318,73 @@ if CHILD_MODE:
                 self.accept()
             else:
                 QtWidgets.QMessageBox.warning(self, "Incorrect Password", "Incorrect password. Try again.")
-                self.password_edit.clear()
-                self.password_edit.setFocus()
+                self.password_edit.clear(); self.password_edit.setFocus()
 
     class ScreensaverChild(QtWidgets.QMainWindow):
-        def __init__(self, run_mode: str):
+        def __init__(self, run_mode: str, ctl_port: int):
             super().__init__()
             self.config = ConfigManager(CONFIG_PATH)
-            self.run_mode = run_mode  # "normal" | "test"
+            self.run_mode = run_mode
+            self.ctl_port = ctl_port
             self.setWindowTitle("MP4Saver - Screensaver (child)")
             self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint, True)
             self.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
             self.setCursor(QtCore.Qt.CursorShape.BlankCursor)
             self.setStyleSheet("background-color: black;")
             self._last_mouse_pos = QtCore.QPoint(-1, -1)
-            central = QtWidgets.QWidget(self)
-            self.setCentralWidget(central)
+
+            central = QtWidgets.QWidget(self); self.setCentralWidget(central)
             self.stack = QtWidgets.QStackedLayout(central)
             self.stack.setStackingMode(QtWidgets.QStackedLayout.StackingMode.StackAll)
+
             container = QtWidgets.QWidget(central)
             vbox = QtWidgets.QVBoxLayout(container); vbox.setContentsMargins(0,0,0,0)
-            self.player = VLCPlayerWidget(self.config, container)
-            vbox.addWidget(self.player)
-            self.test_overlay = OverlayPrompt(central)
-            self.test_overlay.hide()
+            self.player = VLCPlayerWidget(self.config, container); vbox.addWidget(self.player)
+
+            self.test_overlay = OverlayPrompt(central); self.test_overlay.hide()
             self.test_overlay.accepted.connect(lambda: self._exit(EXIT_TEST_RETURN))
-            # A4: Transition overlay
-            self.transition_overlay = TransitionOverlay(central)
-            self.transition_overlay.hide()
+
+            self.transition_overlay = TransitionOverlay(central); self.transition_overlay.hide()
+
             self.stack.addWidget(container)
             self.stack.addWidget(self.test_overlay)
             self.stack.addWidget(self.transition_overlay)
+
             # Configure player
             self.player.set_volume(int(self.config.data["volume"]))
             self.player.set_loop(bool(self.config.data["loop"]))
             self.player.set_shuffle(bool(self.config.data["shuffle"]))
             self.player.set_playlist(self.config.data.get("playlist", []))
             self.player.ended.connect(self._on_playlist_finished)
-            # ESC
+
+            # ESC shortcut triggers unlock request
             self.esc_sc = QtGui.QShortcut(QtGui.QKeySequence("Esc"), self)
             self.esc_sc.activated.connect(self._request_unlock)
-            # Optional remote control (Flask) — background thread
-            self._remote_server = None
-            if self.config.data.get("remote_control_enable", False):
-                self._start_remote_server()
-        # ----- New Features -----
+
+            # Control client
+            self.ctrl_client = ControlClient(self.ctl_port, self)
+            self.ctrl_client.timeoutCommand.connect(self._on_timeout_command)
+            self.ctrl_client.start()
+
         def setup_multi_monitor(self):
-            if not self.config.data.get("multi_monitor_enable", False):
-                return
-            app = QtWidgets.QApplication.instance()
-            screens = app.screens()
-            if not screens:
-                return
+            if not self.config.data.get("multi_monitor_enable", False): return
+            app = QtWidgets.QApplication.instance(); screens = app.screens()
+            if not screens: return
             total = QtCore.QRect()
             for s in screens:
                 total = total.united(s.geometry())
             self.setGeometry(total)
-        def _do_transition(self):
-            if not self.config.data.get("transition_enable", False):
-                return
-            dur = int(self.config.data.get("transition_duration_ms", 600))
-            self.transition_overlay.setGeometry(self.rect())
-            self.transition_overlay.crossfade(duration_ms=dur)
-        # Remote control (skeleton)
-        def _start_remote_server(self):
-            try:
-                from threading import Thread
-                try:
-                    from flask import Flask, request, jsonify
-                except Exception:
-                    logger.warning("Flask not installed; remote control disabled.")
-                    return
-                app = Flask("MP4SaverRemote")
-                cfg = self.config
-                @app.get("/api/playlist")
-                def get_playlist():
-                    return jsonify(cfg.data.get("playlist", []))
-                @app.post("/api/playlist")
-                def set_playlist():
-                    data = request.get_json(silent=True) or {}
-                    plist = data.get("playlist", [])
-                    if not isinstance(plist, list):
-                        return jsonify({"ok": False, "err": "playlist must be a list"}), 400
-                    cfg.data["playlist"] = plist
-                    cfg.save()
-                    return jsonify({"ok": True})
-                @app.post("/api/action")
-                def action():
-                    data = request.get_json(silent=True) or {}
-                    cmd = data.get("cmd")
-                    if cmd == "pause":
-                        self.player.pause(); return jsonify({"ok": True})
-                    if cmd == "play":
-                        self.player.play(); return jsonify({"ok": True})
-                    if cmd == "unlock":
-                        QtCore.QTimer.singleShot(0, lambda: self._exit(EXIT_UNLOCKED))
-                        return jsonify({"ok": True})
-                    return jsonify({"ok": False, "err": "unknown cmd"}), 400
-                port = int(self.config.data.get("remote_control_port", 8080))
-                def run():
-                    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
-                t = Thread(target=run, daemon=True)
-                t.start()
-                self._remote_server = t
-                logger.info("Remote control server started on 127.0.0.1:%s", port)
-            except Exception as e:
-                logger.warning("Remote control server failed: %s", e)
 
-        # ----- Flow -----
+        def _do_transition(self):
+            if not self.config.data.get("transition_enable", False): return
+            dur = int(self.config.data.get("transition_duration_ms", 600))
+            self.transition_overlay.setGeometry(self.rect()); self.transition_overlay.crossfade(duration_ms=dur)
+
         def require_password(self) -> bool:
             if self.run_mode == "test":
                 return False
             return self.config.data.get("unlock_mode", "windows") != "no_password"
+
         def showEvent(self, event: QtGui.QShowEvent):
             super().showEvent(event)
             self.setup_multi_monitor()
@@ -1246,41 +1393,35 @@ if CHILD_MODE:
             if self.config.data.get("power_prevent_sleep", True):
                 set_thread_execution_state(True)
             QtCore.QTimer.singleShot(150, self.player.play)
+
         def resizeEvent(self, e: QtGui.QResizeEvent):
             super().resizeEvent(e)
             self.test_overlay.setGeometry(self.rect())
             self.transition_overlay.setGeometry(self.rect())
+
         def closeEvent(self, event: QtGui.QCloseEvent):
             if self.config.data.get("power_prevent_sleep", True):
                 set_thread_execution_state(False)
             self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+            try:
+                self.ctrl_client.stop()
+            except Exception:
+                pass
             super().closeEvent(event)
 
-        # --- A4: optional explicit cleanup ---
         def cleanup_resources(self):
-            """Proper cleanup before exit (optional, controlled by config)"""
             logger.info("Child explicit cleanup: begin")
             try:
-                try:
-                    self.player.stop()
-                except Exception:
-                    pass
-                try:
-                    self.player.media_player.release()
-                except Exception:
-                    pass
-                try:
-                    self.player.media_list_player.release()
-                except Exception:
-                    pass
-                try:
-                    self.player.media_list.release()
-                except Exception:
-                    pass
-                try:
-                    self.player.instance.release()
-                except Exception:
-                    pass
+                try: self.player.stop()
+                except Exception: pass
+                try: self.player.media_player.release()
+                except Exception: pass
+                try: self.player.media_list_player.release()
+                except Exception: pass
+                try: self.player.media_list.release()
+                except Exception: pass
+                try: self.player.instance.release()
+                except Exception: pass
             except Exception as e:
                 logger.warning("cleanup_resources exception: %s", e)
             finally:
@@ -1288,16 +1429,12 @@ if CHILD_MODE:
                 QtWidgets.QApplication.quit()
 
         def _exit(self, code: int):
-            # Respect config explicit cleanup mode
             if self.config.data.get("explicit_cleanup_on_exit", False):
-                # Map exit semantics: schedule cleanup then exit with code via on-aboutToQuit
                 app = QtWidgets.QApplication.instance()
-                def finalize():
-                    os._exit(code)
+                def finalize(): os._exit(code)
                 app.aboutToQuit.connect(finalize)
                 QtCore.QTimer.singleShot(0, self.cleanup_resources)
                 return
-            # Default: hard exit (most stable)
             os._exit(code)
 
         def _on_playlist_finished(self):
@@ -1330,10 +1467,21 @@ if CHILD_MODE:
                 except Exception:
                     pass
 
+        # Control command handler: duration end => auto action with no user key
+        def _on_timeout_command(self):
+            logger.info("Child: timeout command received.")
+            if not self.require_password():
+                self._exit(EXIT_USER)
+                return
+            # Show password dialog now (no keyboard required)
+            self._request_unlock()
+
         def keyPressEvent(self, event: QtGui.QKeyEvent):
             self._request_unlock()
+
         def mousePressEvent(self, event: QtGui.QMouseEvent):
             self._request_unlock()
+
         def mouseMoveEvent(self, event: QtGui.QMouseEvent):
             if self._last_mouse_pos == QtCore.QPoint(-1, -1):
                 self._last_mouse_pos = event.globalPosition().toPoint()
@@ -1345,7 +1493,6 @@ if CHILD_MODE:
 
     def excepthook_child(exctype, value, tb):
         logger.exception("Uncaught exception (child)", exc_info=(exctype, value, tb))
-        # Hard exit to avoid libVLC finalizers
         os._exit(1)
 
     def main_child():
@@ -1356,14 +1503,10 @@ if CHILD_MODE:
                     VLC_LOG_PATH.unlink()
             except Exception:
                 pass
-        # parse mode
-        mode = "normal"
-        for arg in sys.argv:
-            if arg.startswith("--mode="):
-                mode = arg.split("=", 1)[1].strip().lower() or "normal"
-        app = QtWidgets.QApplication([a for a in sys.argv if a not in ("--debug","--child") and not a.startswith("--mode=")])
+        mode, ctl_port = parse_child_args()
+        app = QtWidgets.QApplication([a for a in sys.argv if a not in ("--debug","--child") and not a.startswith("--mode=") and not a.startswith("--ctl-port=")])
         app.setApplicationName(APP_NAME + " Child")
-        w = ScreensaverChild(mode)
+        w = ScreensaverChild(mode, ctl_port)
         w.show()
         rc = app.exec()
         os._exit(EXIT_USER)
